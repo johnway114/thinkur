@@ -13,7 +13,7 @@ final class AudioCaptureManager: AudioCapturing {
 
     private(set) var isCapturing = false
     private var configChangeObserver: NSObjectProtocol?
-
+    private var configChangeTask: Task<Void, Never>?
     /// Current audio level 0.0–1.0 (RMS), updated every buffer callback (~23ms at 1024/44.1kHz).
     /// Thread-safe: written on audio callback thread, read on main thread.
     private let _audioLevel = Mutex<Float>(0)
@@ -29,7 +29,8 @@ final class AudioCaptureManager: AudioCapturing {
     }
 
     deinit {
-        stopAudioEngine()
+        configChangeTask?.cancel()
+        stopAudioEngine(keepCapturingState: false)
     }
 
     func startCapture() throws {
@@ -50,72 +51,82 @@ final class AudioCaptureManager: AudioCapturing {
         do {
             try startAudioEngine()
         } catch {
-            stopAudioEngine()
+            stopAudioEngine(keepCapturingState: false)
             throw error
         }
     }
 
     private func startAudioEngine() throws {
-        let engine = AVAudioEngine()
-        audioEngine = engine
+        try safeObjC {
+            let engine = AVAudioEngine()
+            self.audioEngine = engine
 
-        // Observe before touching the input node or starting the engine: opening
-        // a Bluetooth microphone can itself change the hardware configuration.
-        configChangeObserver = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange,
-            object: engine,
-            queue: nil
-        ) { [weak self, weak engine] _ in
-            // Return to Core Audio immediately; rebuild outside its notification.
-            Task { @MainActor [weak self, weak engine] in
-                guard let self, let engine, self.audioEngine === engine else { return }
-                self.handleConfigurationChange()
+            // Observe before touching the input node or starting the engine: opening
+            // a Bluetooth microphone can itself change the hardware configuration.
+            self.configChangeObserver = NotificationCenter.default.addObserver(
+                forName: .AVAudioEngineConfigurationChange,
+                object: engine,
+                queue: nil
+            ) { [weak self, weak engine] _ in
+                // Return to Core Audio immediately; rebuild outside its notification.
+                Task { @MainActor [weak self, weak engine] in
+                    guard let self, let engine, self.audioEngine === engine else { return }
+                    self.handleConfigurationChange()
+                }
             }
+
+            let inputNode = engine.inputNode
+            let inputFormat = inputNode.outputFormat(forBus: 0)
+            guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+                Logger.audio.error("Invalid microphone input format: \(inputFormat)")
+                throw AudioCaptureError.invalidInputFormat
+            }
+
+            guard let converter = AVAudioConverter(from: inputFormat, to: self.targetFormat) else {
+                Logger.audio.error("Failed to create audio converter from \(inputFormat) to \(self.targetFormat)")
+                throw AudioCaptureError.converterCreationFailed
+            }
+
+            inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
+                self?.processInputBuffer(buffer, converter: converter)
+            }
+            self.tappedInputNode = inputNode
+
+            engine.prepare()
+            try engine.start()
+            self.isCapturing = true
+
+            Logger.audio.info("Audio capture started at \(inputFormat.sampleRate)Hz, converting to \(Constants.sampleRate)Hz")
         }
-
-        let inputNode = engine.inputNode
-        let inputFormat = inputNode.outputFormat(forBus: 0)
-        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
-            Logger.audio.error("Invalid microphone input format: \(inputFormat)")
-            throw AudioCaptureError.invalidInputFormat
-        }
-
-        guard let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
-            Logger.audio.error("Failed to create audio converter from \(inputFormat) to \(self.targetFormat)")
-            throw AudioCaptureError.converterCreationFailed
-        }
-
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
-            self?.processInputBuffer(buffer, converter: converter)
-        }
-        tappedInputNode = inputNode
-
-        engine.prepare()
-        try engine.start()
-        isCapturing = true
-
-        Logger.audio.info("Audio capture started at \(inputFormat.sampleRate)Hz, converting to \(Constants.sampleRate)Hz")
     }
 
     /// Release resources even when startup or route recovery already failed.
-    private func stopAudioEngine() {
+    private func stopAudioEngine(keepCapturingState: Bool = false) {
         if let observer = configChangeObserver {
             NotificationCenter.default.removeObserver(observer)
             configChangeObserver = nil
         }
         let engine = audioEngine
         audioEngine = nil // Invalidate notifications already queued for this engine.
-        engine?.stop()
-        tappedInputNode?.removeTap(onBus: 0)
+        let node = tappedInputNode
         tappedInputNode = nil
-        engine?.reset()
-        isCapturing = false
-        _audioLevel.withLock { $0 = 0 }
+
+        _ = try? safeObjC {
+            node?.removeTap(onBus: 0)
+            engine?.stop()
+            engine?.reset()
+        }
+
+        if !keepCapturingState {
+            isCapturing = false
+            _audioLevel.withLock { $0 = 0 }
+        }
     }
 
     func stopCapture() -> [Float] {
-        stopAudioEngine()
-
+        configChangeTask?.cancel()
+        configChangeTask = nil
+        stopAudioEngine(keepCapturingState: false)
         // Always drain — preserves partial audio after config change failures
         let samples = bufferQueue.sync {
             var result: [Float] = []
@@ -174,16 +185,49 @@ final class AudioCaptureManager: AudioCapturing {
 
     private func handleConfigurationChange() {
         guard isCapturing else { return }
-        Logger.audio.info("Audio configuration changed — rebuilding audio pipeline")
+        Logger.audio.info("Audio configuration changed — scheduling debounced recovery")
 
-        // Keep accumulated samples, but discard the old hardware graph and its
-        // observer. Queued notifications from that graph cannot affect the new one.
-        stopAudioEngine()
-        do {
-            try startAudioEngine()
-        } catch {
-            Logger.audio.error("Failed to restart engine after config change: \(error)")
-            stopAudioEngine()
+        // Cancel any pending debounced rebuild
+        configChangeTask?.cancel()
+
+        // Debounce: Bluetooth audio routing triggers 2-4 configuration changes
+        // in rapid succession (100-300ms). Wait for CoreAudio to settle before rebuilding.
+        configChangeTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled, let self, self.isCapturing else { return }
+            self.rebuildAudioPipeline()
+        }
+    }
+
+    private func rebuildAudioPipeline() {
+        guard isCapturing else { return }
+        Logger.audio.info("Rebuilding audio pipeline after route change")
+
+        // Retain capturing state while attempting recovery
+        stopAudioEngine(keepCapturingState: true)
+
+        // Try up to 3 times with backoff if hardware format is still stabilizing
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            for attempt in 1...3 {
+                guard self.isCapturing else { break }
+                do {
+                    try self.startAudioEngine()
+                    Logger.audio.info("Audio pipeline successfully rebuilt on attempt \(attempt)")
+                    return
+                } catch {
+                    Logger.audio.warning("Audio pipeline rebuild attempt \(attempt) failed: \(error)")
+                    self.stopAudioEngine(keepCapturingState: true)
+                    if attempt < 3 {
+                        try? await Task.sleep(nanoseconds: 200_000_000)
+                    }
+                }
+            }
+
+            if self.isCapturing && self.audioEngine == nil {
+                Logger.audio.error("Audio pipeline failed to rebuild after 3 attempts — stopping capture")
+                self.stopAudioEngine(keepCapturingState: false)
+            }
         }
     }
 }

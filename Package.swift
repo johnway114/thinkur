@@ -14,9 +14,14 @@ let package = Package(
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.11.0"),
     ],
     targets: [
+        .target(
+            name: "ObjCExceptionCatcher",
+            path: "Sources/ObjCExceptionCatcher"
+        ),
         .executableTarget(
             name: "thinkur",
             dependencies: [
+                "ObjCExceptionCatcher",
                 .product(name: "FluidAudio", package: "FluidAudio"),
                 .product(name: "TelemetryDeck", package: "SwiftSDK"),
                 .product(name: "Sparkle", package: "Sparkle"),

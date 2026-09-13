@@ -27,6 +27,7 @@ targets:
     sources:
       - Sources/thinkur
     dependencies:
+      - target: ObjCExceptionCatcher
       - package: FluidAudio
       - package: Sparkle
       - package: TelemetryDeck
@@ -62,22 +63,31 @@ targets:
           THINKUR_SHARED_LICENSE_SERVICE: com.jyo.thinkur.license
           THINKUR_SECRET_SERVICE_PREFIX: com.jyo.thinkur.dev
         release:
-          CODE_SIGN_STYLE: Manual
-          CODE_SIGN_IDENTITY: "Developer ID Application"
-          OTHER_CODE_SIGN_FLAGS: "--timestamp --options runtime"
+          CODE_SIGN_STYLE: Automatic
+          CODE_SIGN_IDENTITY: "-"
+          OTHER_CODE_SIGN_FLAGS: ""
           PRODUCT_BUNDLE_IDENTIFIER: com.jyo.thinkur
           PRODUCT_NAME: thinkur
           THINKUR_APP_MODE: release
           THINKUR_SUPPORT_DIR_NAME: thinkur
-          THINKUR_ENABLE_SPARKLE: "YES"
-          THINKUR_SU_FEED_URL: "https://thinkur.app/appcast.xml"
-          THINKUR_ENABLE_TELEMETRY: "YES"
+          THINKUR_ENABLE_SPARKLE: "NO"
+          THINKUR_SU_FEED_URL: ""
+          THINKUR_ENABLE_TELEMETRY: "NO"
           THINKUR_SHARED_LICENSE_SERVICE: com.jyo.thinkur.license
           THINKUR_SECRET_SERVICE_PREFIX: com.jyo.thinkur
     entitlements:
       path: Sources/thinkur/Resources/thinkur.entitlements
       properties:
         com.apple.security.device.audio-input: true
+
+  ObjCExceptionCatcher:
+    type: library.static
+    platform: macOS
+    sources:
+      - Sources/ObjCExceptionCatcher
+    settings:
+      base:
+        PUBLIC_HEADERS_FOLDER_PATH: include
 
   thinkur-mcp:
     type: tool

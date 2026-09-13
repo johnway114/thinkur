@@ -156,7 +156,9 @@ final class ToneGenerator {
 
         // Tear down previous source node
         if let node = currentSourceNode {
-            engine?.detach(node)
+            _ = try? safeObjC {
+                engine?.detach(node)
+            }
             currentSourceNode = nil
         }
 
@@ -189,13 +191,20 @@ final class ToneGenerator {
             return noErr
         }
 
-        eng.attach(sourceNode)
-        eng.connect(sourceNode, to: eng.mainMixerNode, format: format)
-        currentSourceNode = sourceNode
-
         do {
-            try eng.start()
+            try safeObjC {
+                eng.attach(sourceNode)
+                eng.connect(sourceNode, to: eng.mainMixerNode, format: format)
+                currentSourceNode = sourceNode
+                try eng.start()
+            }
         } catch {
+            _ = try? safeObjC {
+                eng.detach(sourceNode)
+                eng.stop()
+                eng.reset()
+            }
+            if engine === eng { engine = nil }
             return
         }
 
@@ -204,15 +213,16 @@ final class ToneGenerator {
         let durationSeconds = Double(totalSamples) / sampleRate + 0.05
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            if let node = self.currentSourceNode {
-                self.engine?.detach(node)
-                self.currentSourceNode = nil
+            _ = try? safeObjC {
+                if let node = self.currentSourceNode {
+                    self.engine?.detach(node)
+                    self.currentSourceNode = nil
+                }
+                self.engine?.stop()
+                self.engine?.reset()
             }
-            self.engine?.stop()
-            self.engine?.reset()
             self.engine = nil
         }
-        stopWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + durationSeconds, execute: workItem)
     }
 }
