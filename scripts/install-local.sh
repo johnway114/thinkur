@@ -19,11 +19,14 @@ xcodebuild -quiet -project thinkur.xcodeproj -scheme thinkur \
 
 BUILT_APP="$BUILD_DIR/Build/Products/Release/thinkur.app"
 
-echo "==> Signing app locally (ad-hoc with audio input entitlements)..."
-codesign --force --deep --sign - \
+echo "==> Signing app locally with developer identity..."
+SIGN_ID="Apple Development: John Conway (4K8PNC8NZQ)"
+if ! security find-identity -p codesigning -v | grep -q "$SIGN_ID"; then
+    SIGN_ID="-"
+fi
+codesign --force --deep --sign "$SIGN_ID" \
   --entitlements "$PROJECT_DIR/Sources/thinkur/Resources/thinkur.entitlements" \
   "$BUILT_APP"
-
 echo "==> Stopping currently running thinkur..."
 if pgrep -x "thinkur" >/dev/null 2>&1; then
     killall "thinkur" 2>/dev/null || true
